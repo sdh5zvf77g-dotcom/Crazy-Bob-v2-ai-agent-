@@ -567,6 +567,7 @@
         <label for="serperKey">Serper.dev API key <span style="color:var(--text-muted);font-weight:400;">(2,500 free)</span></label>
         <input type="password" id="serperKey" placeholder="Paste key from serper.dev" autocomplete="off"
           style="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px;">
+        <button type="button" id="testSerperBtn" class="btn-secondary" style="padding:8px 12px;font-size:13px;">Test Serper key</button>
       </div>
       <p class="settings-hint">Get a free key at <a href="https://serper.dev" target="_blank" rel="noopener" style="color:var(--accent);">serper.dev</a> — no card needed.</p>
 
@@ -574,8 +575,10 @@
         <label for="tavilyKey">Tavily API key <span style="color:var(--text-muted);font-weight:400;">(1,000/mo free)</span></label>
         <input type="password" id="tavilyKey" placeholder="Paste key from tavily.com" autocomplete="off"
           style="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px;">
+        <button type="button" id="testTavilyBtn" class="btn-secondary" style="padding:8px 12px;font-size:13px;">Test Tavily key</button>
       </div>
       <p class="settings-hint">Great for AI — get free key at <a href="https://tavily.com" target="_blank" rel="noopener" style="color:var(--accent);">tavily.com</a>.</p>
+      <p id="apiKeyTestResult" class="settings-hint" style="margin-top:8px;min-height:1.2em;"></p>
 
       <div class="modal-actions" style="margin-top:18px;">
         <button class="btn-secondary" id="closeSettings">Done</button>
@@ -637,7 +640,7 @@
         compressOldHistoryIfNeeded(msgs).catch(() => {});
       }
       const db = await openDB();
-      return new Promise((resolve, reject) => {
+      await new Promise((resolve, reject) => {
         const tx = db.transaction([STORE_MESSAGES, STORE_META], "readwrite");
         const store = tx.objectStore(STORE_MESSAGES);
         store.clear();
@@ -648,6 +651,10 @@
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
       });
+      // Periodic offline backup every ~40 turns
+      if (msgs.length > 0 && msgs.length % 40 === 0) {
+        maybeAutoBackup("turns").catch(() => {});
+      }
     }
 
     async function loadMessages() {
@@ -1075,12 +1082,49 @@
 
     async function setUserProfile(text) {
       const db = await openDB();
-      return new Promise((resolve, reject) => {
+      await new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_PROFILE, "readwrite");
         tx.objectStore(STORE_PROFILE).put({ key: "main", text: text || "", updated: Date.now() });
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
       });
+      // Offline knowledge backup when profile changes
+      maybeAutoBackup("profile").catch(() => {});
+    }
+
+    let lastAutoBackup = 0;
+    async function maybeAutoBackup(reason = "periodic") {
+      // At most once per 10 minutes; also after profile updates
+      const now = Date.now();
+      if (reason !== "profile" && now - lastAutoBackup < 10 * 60 * 1000) return;
+      if (reason !== "profile" && messages.length > 0 && messages.length % 40 !== 0) return;
+      lastAutoBackup = now;
+      try {
+        const rules = await loadRules(100);
+        const events = await loadRecentEvents(200);
+        const profile = await getUserProfile();
+        const payload = {
+          version: 2,
+          exportedAt: new Date().toISOString(),
+          reason,
+          userName: userName || null,
+          personality: personality || "classic",
+          messages: messages.slice(-400),
+          rules,
+          events,
+          profile
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `crazy-bob-autobackup-${new Date().toISOString().slice(0, 10)}.json`;
+        // Auto-download is intentional for offline safety on iOS
+        a.click();
+        URL.revokeObjectURL(a.href);
+        console.log("[Bob] Auto-backup saved:", reason);
+      } catch (err) {
+        console.warn("[Bob] Auto-backup failed", err);
+      }
     }
 
     // Background compression: when history is about to be trimmed, summarise the oldest part into the permanent profile
@@ -1197,6 +1241,39 @@ Write a clean, concise third-person profile (max 450 words). Keep previous impor
     }
 
     // Bob v4 Semantic RAG — cosine similarity when vectors exist, keyword hybrid fallback
+    function keywordScore(query, text) {
+      const q = (query || "").toLowerCase();
+      const terms = q.split(/[^a-z0-9\u0e00-\u0e7f]+/).filter(t => t.length > 2);
+      if (!terms.length) return 0;
+      const t = (text || "").toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (t.includes(term)) score += 2;
+        try {
+          const m = t.match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"));
+          if (m) score += Math.min(m.length, 4);
+        } catch (_) {}
+      }
+      return score;
+    }
+
+    // Reciprocal Rank Fusion of vector rank + keyword rank
+    function rrfFusion(vectorRanked, keywordRanked, k = 60) {
+      const scores = new Map();
+      const byId = new Map();
+      vectorRanked.forEach((c, i) => {
+        byId.set(c.id, c);
+        scores.set(c.id, (scores.get(c.id) || 0) + 1 / (k + i + 1));
+      });
+      keywordRanked.forEach((c, i) => {
+        byId.set(c.id, c);
+        scores.set(c.id, (scores.get(c.id) || 0) + 1 / (k + i + 1));
+      });
+      return [...scores.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([id, score]) => ({ ...byId.get(id), score }));
+    }
+
     async function retrieveRelevantChunks(query, maxChunks = 5) {
       const db = await openDB();
       const allChunks = await new Promise((resolve) => {
@@ -1207,58 +1284,38 @@ Write a clean, concise third-person profile (max 450 words). Keep previous impor
       });
       if (!allChunks.length) return [];
 
-      // Try semantic search via worker / embeddings
+      // Keyword ranking (always)
+      const keywordRanked = allChunks
+        .map(c => ({ ...c, kw: keywordScore(query, c.text) }))
+        .filter(c => c.kw > 0)
+        .sort((a, b) => b.kw - a.kw);
+
+      // Vector ranking (when available)
+      let vectorRanked = [];
       try {
         const hasVectors = allChunks.some(c => c.vector && c.vector.length);
-        if (hasVectors || embedderReady || workerReady) {
+        if (hasVectors || embedderReady) {
           let queryVector = null;
           const vecs = await embedTextsMain([query.slice(0, 400)]);
           if (vecs && vecs[0]) queryVector = vecs[0];
-
           if (queryVector) {
-            const scored = allChunks
+            vectorRanked = allChunks
               .filter(c => c.vector)
-              .map(c => ({ ...c, score: cosineSim(queryVector, c.vector) }))
-              .filter(c => c.score > 0.28)
-              .sort((a, b) => b.score - a.score)
-              .slice(0, maxChunks);
-            if (scored.length) return scored;
-          }
-
-          // Worker path
-          if (workerReady) {
-            try {
-              const res = await workerCall("semantic_search", {
-                query,
-                chunks: allChunks.map(c => ({ id: c.id, text: c.text, name: c.name, vector: c.vector })),
-                queryVector,
-                max: maxChunks
-              });
-              if (res.results?.length) return res.results;
-            } catch (_) {}
+              .map(c => ({ ...c, sim: cosineSim(queryVector, c.vector) }))
+              .filter(c => c.sim > 0.22)
+              .sort((a, b) => b.sim - a.sim);
           }
         }
       } catch (err) {
-        console.warn("[Bob v4] Semantic retrieve fallback", err);
+        console.warn("[Bob] vector rank skipped", err);
       }
 
-      // Keyword hybrid fallback (always available)
-      const q = query.toLowerCase();
-      const terms = q.split(/[^a-z0-9\u0e00-\u0e7f]+/).filter(t => t.length > 2);
-      if (!terms.length) return allChunks.slice(0, maxChunks);
-
-      return allChunks.map(c => {
-        const t = (c.text || "").toLowerCase();
-        let score = 0;
-        for (const term of terms) {
-          if (t.includes(term)) score += 2;
-          const m = t.match(new RegExp(term, "gi"));
-          if (m) score += Math.min(m.length, 3);
-        }
-        return { ...c, score };
-      }).filter(c => c.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, maxChunks);
+      if (vectorRanked.length && keywordRanked.length) {
+        return rrfFusion(vectorRanked, keywordRanked).slice(0, maxChunks);
+      }
+      if (vectorRanked.length) return vectorRanked.slice(0, maxChunks).map(c => ({ ...c, score: c.sim }));
+      if (keywordRanked.length) return keywordRanked.slice(0, maxChunks).map(c => ({ ...c, score: c.kw }));
+      return allChunks.slice(0, maxChunks);
     }
 
     async function buildRAGContext(userQuery) {
@@ -2020,7 +2077,7 @@ Your job is to improve the result:
       const chunks = await engine.chat.completions.create({
         messages: agentMessages,
         stream: true,
-        temperature: 0.65,
+        temperature: 0.35,
         max_tokens: 900
       });
 
@@ -2070,6 +2127,7 @@ Your job is to improve the result:
 
           const systemPrompt = await buildSingleSystem(text);
           // Hierarchical token budget on history (keep newest that fit)
+          // CoT already stripped via parseCoT above
           const budgetedHist = budgetContext({
             systemCore: "",
             rag: "",
@@ -2077,9 +2135,18 @@ Your job is to improve the result:
             historyMessages: historyForModel
           }).history;
 
+          // Dynamic system-prompt reinforcement for small models:
+          // re-inject a compact constraint reminder just before the latest user turn
+          const style = personalityStyles[personality] || personalityStyles.classic;
+          const reinforce = {
+            role: "system",
+            content: `Reminder: You are Crazy Bob on-device. ${style} Stay on-topic, be concise, use <think>…</think> then answer. Do not invent facts.`
+          };
           const singleMessages = [
             { role: "system", content: systemPrompt },
-            ...budgetedHist
+            ...budgetedHist.slice(0, -1),
+            reinforce,
+            ...budgetedHist.slice(-1)
           ];
 
           const div = addMessage("assistant", "", null, true);
@@ -2089,7 +2156,7 @@ Your job is to improve the result:
           const chunks = await engine.chat.completions.create({
             messages: singleMessages,
             stream: true,
-            temperature: 0.7,
+            temperature: 0.15,
             max_tokens: 1024
           });
 
@@ -2540,7 +2607,7 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
         const chunks = await engine.chat.completions.create({
           messages: singleMessages,
           stream: true,
-          temperature: 0.6,
+          temperature: 0.15,
           max_tokens: 1100
         });
         let full = "";
@@ -3187,6 +3254,47 @@ Source: CoinGecko`;
     tavilyKeyEl?.addEventListener("blur", async () => {
       tavilyKey = (tavilyKeyEl.value || "").trim();
       await setMeta("tavilyKey", tavilyKey);
+    });
+
+    async function showApiTest(msg, ok) {
+      const el = document.getElementById("apiKeyTestResult");
+      if (!el) return;
+      el.style.color = ok ? "var(--success)" : "var(--danger)";
+      el.textContent = msg;
+    }
+
+    document.getElementById("testSerperBtn")?.addEventListener("click", async () => {
+      serperKey = (serperKeyEl?.value || "").trim();
+      await setMeta("serperKey", serperKey);
+      if (!serperKey) {
+        showApiTest("Paste a Serper key first.", false);
+        return;
+      }
+      showApiTest("Testing Serper…", true);
+      try {
+        const result = await fetchSerper("Thailand news today");
+        const preview = (result.text || "").slice(0, 80).replace(/\s+/g, " ");
+        showApiTest("Serper OK — " + (preview || "got results"), true);
+      } catch (err) {
+        showApiTest("Serper failed: " + (err.message || err), false);
+      }
+    });
+
+    document.getElementById("testTavilyBtn")?.addEventListener("click", async () => {
+      tavilyKey = (tavilyKeyEl?.value || "").trim();
+      await setMeta("tavilyKey", tavilyKey);
+      if (!tavilyKey) {
+        showApiTest("Paste a Tavily key first.", false);
+        return;
+      }
+      showApiTest("Testing Tavily…", true);
+      try {
+        const result = await fetchTavily("Thailand news today");
+        const preview = (result.text || "").slice(0, 80).replace(/\s+/g, " ");
+        showApiTest("Tavily OK — " + (preview || "got results"), true);
+      } catch (err) {
+        showApiTest("Tavily failed: " + (err.message || err), false);
+      }
     });
 
     // Voices often load asynchronously
