@@ -2409,18 +2409,18 @@ Your job is to improve the result:
             historyMessages: historyForModel
           }).history;
 
-          // Dynamic system-prompt reinforcement for small models:
-          // re-inject a compact constraint reminder just before the latest user turn
+          // WebLLM requires: exactly ONE system message, and it must be first.
+          // Reinforcement is appended into that single system prompt (not a second system role).
           const style = personalityStyles[personality] || personalityStyles.classic;
-          const reinforce = {
-            role: "system",
-            content: `Reminder: You are Crazy Bob on-device. ${style} Stay on-topic, be concise, use <think>…</think> then answer. Do not invent facts.`
-          };
+          const reinforcedSystem =
+            systemPrompt +
+            `\n\nReminder: Stay on-topic. ${style} Be concise. Use <think>…</think> then answer. Do not invent facts.`;
+
+          // Only user/assistant turns after system; never inject another system mid-array
+          const chatTurns = budgetedHist.filter(m => m.role === "user" || m.role === "assistant");
           const singleMessages = [
-            { role: "system", content: systemPrompt },
-            ...budgetedHist.slice(0, -1),
-            reinforce,
-            ...budgetedHist.slice(-1)
+            { role: "system", content: reinforcedSystem },
+            ...chatTurns
           ];
 
           const div = addMessage("assistant", "", null, true);
@@ -2876,8 +2876,9 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
         rag: "",
         rules: "",
         historyMessages: historyForModel
-      }).history;
+      }).history.filter(m => m.role === "user" || m.role === "assistant");
 
+      // Only one system message, always first
       const singleMessages = [
         { role: "system", content: system },
         ...budgetedHist,
