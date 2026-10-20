@@ -2271,31 +2271,24 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
     // DuckDuckGo Instant Answer (entity-style summary, free, no key)
     async function fetchDuckDuckGo(topic) {
       const q = encodeURIComponent(topic.trim());
-      // JSONP-style endpoint often works; fall back to proxy if CORS blocks
       const direct = `https://api.duckduckgo.com/?q=${q}&format=json&no_html=1&skip_disambig=1`;
-      try {
-        const res = await fetchWithTimeout(direct, {}, 10000);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.AbstractText || data.Abstract) {
-            return {
-              heading: data.Heading || topic,
-              abstract: data.AbstractText || data.Abstract || "",
-              url: data.AbstractURL || `https://duckduckgo.com/?q=${q}`,
-              source: data.AbstractSource || "DuckDuckGo"
-            };
-          }
-        }
-      } catch (_) { /* try proxy */ }
-      const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(direct)}`;
-      const res = await fetchWithTimeout(proxy, {}, 12000);
+      const res = await fetchWithTimeout(direct, {}, 10000);
       if (!res.ok) throw new Error("DuckDuckGo unavailable");
-      const payload = await res.json();
-      const data = JSON.parse(payload.contents || "{}");
-      if (!data.AbstractText && !data.Abstract) throw new Error("No instant answer");
+      const data = await res.json();
+      const abstract = data.AbstractText || data.Abstract || "";
+      // Related topics as weak fallback when no abstract
+      let related = "";
+      if (!abstract && Array.isArray(data.RelatedTopics)) {
+        related = data.RelatedTopics
+          .map(t => t.Text || t.Name || "")
+          .filter(Boolean)
+          .slice(0, 5)
+          .join("\n");
+      }
+      if (!abstract && !related) throw new Error("No instant answer");
       return {
         heading: data.Heading || topic,
-        abstract: data.AbstractText || data.Abstract || "",
+        abstract: abstract || related,
         url: data.AbstractURL || `https://duckduckgo.com/?q=${q}`,
         source: data.AbstractSource || "DuckDuckGo"
       };
@@ -2303,41 +2296,65 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
 
     // News via multiple RSS feeds through CORS proxy
     async function fetchNews() {
+      // Free CORS-friendly RSS→JSON gateway (allorigins/corsproxy broke)
       const feeds = [
         { name: "BBC World", url: "https://feeds.bbci.co.uk/news/world/rss.xml" },
-        { name: "Reuters", url: "https://feeds.reuters.com/reuters/worldNews" },
-        { name: "NPR", url: "https://feeds.npr.org/1001/rss.xml" }
+        { name: "The Guardian", url: "https://www.theguardian.com/world/rss" },
+        { name: "NPR", url: "https://feeds.npr.org/1001/rss.xml" },
+        { name: "Google News", url: "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en" }
       ];
       const allItems = [];
-      for (const feed of feeds) {
+      const errors = [];
+
+      await Promise.all(feeds.map(async (feed) => {
         try {
-          const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(feed.url)}`;
-          const res = await fetchWithTimeout(proxy, {}, 12000);
-          if (!res.ok) continue;
-          const payload = await res.json();
-          const xml = payload.contents || "";
-          const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
-          let match;
-          let count = 0;
-          while ((match = itemRegex.exec(xml)) && count < 4) {
-            const block = match[1];
-            const title = (block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || block.match(/<title>(.*?)<\/title>/) || [])[1];
-            const desc = (block.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/) || block.match(/<description>(.*?)<\/description>/) || [])[1];
-            const link = (block.match(/<link>(.*?)<\/link>/) || [])[1];
-            if (title) {
-              allItems.push({
-                source: feed.name,
-                title: title.replace(/<[^>]+>/g, "").trim(),
-                description: (desc || "").replace(/<[^>]+>/g, "").trim().slice(0, 180),
-                link: (link || "").trim()
-              });
-              count++;
-            }
+          const api = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feed.url)}`;
+          const res = await fetchWithTimeout(api, {
+            headers: { "Accept": "application/json" }
+          }, 12000);
+          if (!res.ok) {
+            errors.push(`${feed.name}: HTTP ${res.status}`);
+            return;
           }
-        } catch (_) { /* skip this feed */ }
+          const data = await res.json();
+          if (data.status !== "ok" || !Array.isArray(data.items)) {
+            errors.push(`${feed.name}: ${data.message || "bad response"}`);
+            return;
+          }
+          for (const item of data.items.slice(0, 4)) {
+            const title = (item.title || "").replace(/<[^>]+>/g, "").trim();
+            if (!title) continue;
+            allItems.push({
+              source: feed.name,
+              title,
+              description: (item.description || item.content || "")
+                .replace(/<[^>]+>/g, " ")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 200),
+              link: (item.link || item.url || "").trim(),
+              pubDate: item.pubDate || ""
+            });
+          }
+        } catch (err) {
+          errors.push(`${feed.name}: ${err.message || err}`);
+        }
+      }));
+
+      // Deduplicate similar titles
+      const seen = new Set();
+      const unique = [];
+      for (const it of allItems) {
+        const key = it.title.toLowerCase().slice(0, 60);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(it);
       }
-      if (allItems.length === 0) throw new Error("No headlines from any feed");
-      return allItems.slice(0, 12);
+
+      if (unique.length === 0) {
+        throw new Error(errors.length ? errors.join("; ") : "No headlines from any feed");
+      }
+      return unique.slice(0, 14);
     }
 
     // Serper.dev Google search (optional key)
@@ -2493,13 +2510,25 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
 
       const historyForModel = messages
         .filter(m => m.role === "user" || m.role === "assistant")
-        .map(m => ({ role: m.role, content: m.content }));
+        .map(m => {
+          const clean = parseCoT(m.content).answer || m.content;
+          return { role: m.role, content: clean };
+        });
 
-      const system = buildSingleSystem() + `\n\nYou have been given fresh online information below. Use it to answer accurately. Mention that the info came from the web if relevant. Do not invent facts beyond the provided text.\n\n--- ONLINE DATA ---\n${contextBlock}\n--- END ---`;
+      // buildSingleSystem is async — must await
+      const baseSystem = await buildSingleSystem(userVisibleText);
+      const system = baseSystem + `\n\nYou have been given fresh online information below. Use it to answer accurately. Mention that the info came from the web if relevant. Do not invent facts beyond the provided text.\n\n--- ONLINE DATA ---\n${contextBlock}\n--- END ---`;
+
+      const budgetedHist = budgetContext({
+        systemCore: "",
+        rag: "",
+        rules: "",
+        historyMessages: historyForModel
+      }).history;
 
       const singleMessages = [
         { role: "system", content: system },
-        ...historyForModel,
+        ...budgetedHist,
         { role: "user", content: instruction }
       ];
 
@@ -2541,11 +2570,11 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
         addMessage("system", "Load a model first, then try Today's news.", null, true);
         return;
       }
-      addMessage("system", "Fetching headlines from BBC, Reuters & NPR…", null, true);
+      addMessage("system", "Fetching live headlines (BBC, Guardian, NPR, Google News)…", null, true);
       try {
         const items = await fetchNews();
         const context = items.map((it, i) =>
-          `${i + 1}. [${it.source}] ${it.title}\n   ${it.description}${it.link ? "\n   Link: " + it.link : ""}`
+          `${i + 1}. [${it.source}] ${it.title}\n   ${it.description}${it.link ? "\n   Link: " + it.link : ""}${it.pubDate ? "\n   " + it.pubDate : ""}`
         ).join("\n\n");
         const nameBit = userName ? ` for ${userName}` : "";
         await askBobWithContext(
@@ -2684,11 +2713,13 @@ Suggest a corrected input or a short alternative approach the user can try. Be c
         addMessage("system", "Load a model first.", null, true);
         return;
       }
-      const coin = prompt("Crypto coin or id (e.g. bitcoin, ethereum, solana)", "bitcoin");
+      const coin = prompt("Crypto coin or id (e.g. bitcoin, ethereum, solana, btc, eth)", "bitcoin");
       if (!coin || !coin.trim()) return;
       addMessage("system", `Fetching price for “${coin.trim()}”…`, null, true);
       try {
-        const id = coin.trim().toLowerCase().replace(/\s+/g, "-");
+        const aliases = { btc: "bitcoin", eth: "ethereum", sol: "solana", xrp: "ripple", ada: "cardano", doge: "dogecoin", bnb: "binancecoin", usdt: "tether", usdc: "usd-coin" };
+        let id = coin.trim().toLowerCase().replace(/\s+/g, "-");
+        if (aliases[id]) id = aliases[id];
         const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd,thb,eur&include_24hr_change=true&include_market_cap=true`;
         const res = await fetchWithTimeout(url);
         if (!res.ok) throw new Error("CoinGecko unavailable");
@@ -2764,27 +2795,75 @@ Source: CoinGecko`;
       }
       const text = prompt("Text to translate");
       if (!text || !text.trim()) return;
-      const pair = prompt("Target language code (e.g. th, es, fr, ja, zh, de) or full name", "th");
+      const pair = prompt("Target language code (e.g. th, es, fr, ja, zh, de)", "th");
       if (!pair) return;
       addMessage("system", "Translating…", null, true);
       try {
-        // MyMemory free tier (no key for light use)
         const lang = pair.trim().toLowerCase().slice(0, 5);
-        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text.trim())}&langpair=en|${lang}`;
-        const res = await fetchWithTimeout(url);
-        if (!res.ok) throw new Error("Translate service unavailable");
+        const srcGuess = /[\u0e00-\u0e7f]/.test(text) ? "th" : "en";
+        const langpair = `${srcGuess}|${lang}`;
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text.trim().slice(0, 450))}&langpair=${encodeURIComponent(langpair)}`;
+        const res = await fetchWithTimeout(url, {}, 12000);
+        if (!res.ok) throw new Error("Translate service HTTP " + res.status);
         const data = await res.json();
-        const translated = data.responseData?.translatedText || "";
+        let translated = data.responseData?.translatedText || "";
+        // Detect rate-limit / warning payloads
+        if (/MYMEMORY WARNING|YOU USED ALL AVAILABLE/i.test(translated)) {
+          throw new Error("Free translation quota used for today — ask Bob to translate from knowledge instead");
+        }
         if (!translated) throw new Error("No translation returned");
-        const context = `Original (assumed English):\n${text.trim()}\n\nTranslation (${lang}):\n${translated}\n\nSource: MyMemory`;
+        const context = `Original (${srcGuess}):\n${text.trim()}\n\nTranslation (${lang}):\n${translated}\n\nSource: MyMemory`;
         await askBobWithContext(
           `🌍 Translate → ${lang}`,
           context,
           `Present the translation clearly. If the result looks off, note that free translation can be imperfect and offer a polished alternative in your own words.`
         );
       } catch (err) {
-        addMessage("system", "Translation failed: " + (err.message || err) + ". You can still ask Bob to translate from knowledge.", null, true);
+        // Soft fallback: let the local model translate
+        addMessage("system", "Online translate unavailable (" + (err.message || err) + "). Using on-device model…", null, true);
+        userInput.value = `Please translate the following text to ${pair.trim()}:\n\n${text.trim()}`;
+        userInput.dispatchEvent(new Event("input"));
+        sendMessage();
       }
+    }
+
+    async function fetchPageSummary(target) {
+      // 1) Microlink meta (CORS-friendly, free tier)
+      try {
+        const ml = await fetchWithTimeout(
+          `https://api.microlink.io/?url=${encodeURIComponent(target)}`,
+          { headers: { "Accept": "application/json" } },
+          15000
+        );
+        if (ml.ok) {
+          const data = await ml.json();
+          if (data.status === "success" && data.data) {
+            const d = data.data;
+            const parts = [];
+            if (d.title) parts.push("Title: " + d.title);
+            if (d.description) parts.push("Description: " + d.description);
+            if (d.publisher) parts.push("Publisher: " + d.publisher);
+            if (d.author) parts.push("Author: " + d.author);
+            if (d.date) parts.push("Date: " + d.date);
+            if (parts.length) {
+              return { text: parts.join("\n"), source: "Microlink" };
+            }
+          }
+        }
+      } catch (_) {}
+
+      // 2) Wikipedia-style: if it's a wiki URL, use REST API
+      try {
+        const wikiMatch = target.match(/wikipedia\.org\/wiki\/([^?#]+)/i);
+        if (wikiMatch) {
+          const title = decodeURIComponent(wikiMatch[1]);
+          const w = await fetchWikipedia(title.replace(/_/g, " "));
+          if (w?.extract) return { text: `Title: ${w.title}\n\n${w.extract}`, source: "Wikipedia" };
+        }
+      } catch (_) {}
+
+      // 3) Last resort — ask user (no working anonymous full-page proxy left)
+      throw new Error("Could not extract page text (public proxies blocked). Try pasting the article text into chat instead.");
     }
 
     async function handleSummarizeUrl() {
@@ -2798,24 +2877,12 @@ Source: CoinGecko`;
       if (!/^https?:\/\//i.test(target)) target = "https://" + target;
       addMessage("system", `Fetching “${target}”…`, null, true);
       try {
-        const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(target)}`;
-        const res = await fetchWithTimeout(proxy, {}, 18000);
-        if (!res.ok) throw new Error("Could not fetch page");
-        const payload = await res.json();
-        let html = payload.contents || "";
-        // Crude text extraction
-        html = html.replace(/<script[\s\S]*?<\/script>/gi, " ")
-                   .replace(/<style[\s\S]*?<\/style>/gi, " ")
-                   .replace(/<[^>]+>/g, " ")
-                   .replace(/\s+/g, " ")
-                   .trim()
-                   .slice(0, 6000);
-        if (html.length < 80) throw new Error("Page text too short or blocked");
-        const context = `URL: ${target}\n\nExtracted text (truncated):\n${html}`;
+        const page = await fetchPageSummary(target);
+        const context = `URL: ${target}\nSource: ${page.source}\n\n${page.text}`;
         await askBobWithContext(
           `🔗 Summarize: ${target}`,
           context,
-          `Summarise this web page in clear bullet points or short paragraphs. Capture the main idea, key facts, and any important caveats. Note that the text was auto-extracted and may be incomplete.`
+          `Summarise this page in clear bullet points or short paragraphs. Capture the main idea, key facts, and any important caveats. Note if only metadata (title/description) was available rather than full article text.`
         );
       } catch (err) {
         addMessage("system", "Could not summarise URL: " + (err.message || err), null, true);
