@@ -1,38 +1,39 @@
-# Crazy Bob v4.1 🤪 — Omni-Agent (Crash-Fixed)
+# Crazy Bob v5 🤪 — Dual-Core Memory + Sleep Cycle
 
-Private local AI on your phone. WebLLM + WebGPU.
+Private on-device AI (WebLLM + WebGPU). Search tools from v4 remain intact.
 
-## Crash fixes in this build
-- **No auto-load on startup** — you tap **Load** when ready (prevents Safari memory kill)
-- **Embedder starts only after** the chat model is loaded and settled
-- **Previous engine unloaded** before loading a new model
-- **Safe default model**: SmolLM2 360M
-- **q4f32 option** for devices that lack float16 shaders
-- Clearer error messages (OOM / WebGPU / network / f16)
-- Idle embedding only runs in tiny batches when the LLM is already running
+## What is new (safe improvements only)
 
-## Recommended load order on iPhone
-1. Open the app
-2. Leave **SmolLM2 360M** selected (or Qwen 0.5B)
-3. Tap **Load** and wait until status says Ready
-4. Chat normally
-5. Only try Llama 3.2 1B after that works
-6. Avoid 3B on most phones
+### 1. Dual-core memory
+- **Working memory** — in-session slots: goal, project, mood
+- **Episodic memory** — structured micro-episodes in IndexedDB
+- **Semantic profile** — permanent user profile (unchanged, improved)
 
-## If it still fails
-- Close other Safari tabs / apps
-- Use **Llama 3.2 1B q4f32** if you see an f16 error
-- Reload the page and try SmolLM2 again
-- First download needs network; later loads use cache
+### 2. MemGPT-style self-edits
+Bob may emit hidden tags such as:
+`<memory_edit action="append" target="user_profile">fact</memory_edit>`
+Targets: `user_profile`, `episode`, `working_goal`, `project`, `mood`
 
-## Features (unchanged)
-Chain-of-Thought, Team mode, Self-Healing tools, Long-term User Profile,
-Document/PDF offline RAG, Semantic vectors (when embedder loads), Token budgeter,
-Web Worker background tasks, Voice, Export/Import memory.
+### 3. Sleep & dream idle cycle
+While idle (model loaded, tab visible):
+- Embed missing document vectors
+- Consolidate duplicate rules
+- Reflect on tool failures → new rules
+- Optional **proactive goals** pulse
 
-## Files
-- `index.html`
-- `bob-worker.js` (keep next to index.html)
-- icons + `manifest.json`
+### 4. Proactive goals (opt-in)
+Settings → enable Proactive goals, add goals, optionally Enable notifications.
+Bob surfaces one due goal during idle — never spam.
 
-Host the folder over HTTPS (or localhost), open in Safari, Add to Home Screen.
+### 5. Skills store (declarative only)
+IndexedDB `skills` exists for HTTPS URL templates.
+**No arbitrary JS eval** — that would break security and search stability.
+
+## Intentionally NOT implemented
+- Model-written executable JavaScript tools (unsafe on a phone PWA)
+
+## Still included
+All v4 search chips (news, research, web search, weather, currency, crypto, define, translate, URL summarise), CoT, team mode, RAG+RRF, token budget, auto model restore, API key test buttons.
+
+## iPhone tip
+Start with SmolLM2 360M. Load once; later opens restore from cache.

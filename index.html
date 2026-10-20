@@ -544,16 +544,35 @@
 
       <h3 style="font-size:15px;margin-bottom:10px;">Long-term memory & documents</h3>
       <p class="settings-hint" style="margin-bottom:10px;">
-        Bob compresses old chats into a permanent User Profile. You can also upload local text or PDF files for offline RAG.
+        Dual-core memory: working slots + episodes + permanent profile. Upload documents for offline RAG.
       </p>
       <div class="settings-row" style="margin-top:6px;">
         <button type="button" id="viewProfileBtn" class="btn-secondary" style="width:100%;padding:10px;">View / edit User Profile</button>
+      </div>
+      <div class="settings-row" style="margin-top:8px;">
+        <button type="button" id="viewEpisodesBtn" class="btn-secondary" style="width:100%;padding:10px;">View recent episodes</button>
       </div>
       <div class="settings-row" style="margin-top:8px;">
         <button type="button" id="uploadDocBtn" class="btn-secondary" style="width:100%;padding:10px;">Upload document (txt / md / pdf)</button>
         <input type="file" id="docFileInput" accept=".txt,.md,.text,.pdf,text/plain,application/pdf" style="display:none;" multiple>
       </div>
       <div id="docList" style="margin-top:10px;font-size:13px;color:var(--text-muted);"></div>
+
+      <div class="settings-row" style="margin-top:14px;">
+        <label for="proactiveGoals">Proactive goals (idle pulse)</label>
+        <label class="toggle">
+          <input type="checkbox" id="proactiveGoals">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <p class="settings-hint">When enabled, Bob can surface goal reminders while idle. Enable notifications if you want system banners.</p>
+      <div class="settings-row" style="margin-top:6px;">
+        <button type="button" id="addGoalBtn" class="btn-secondary" style="width:100%;padding:10px;">Add a goal</button>
+      </div>
+      <div class="settings-row" style="margin-top:6px;">
+        <button type="button" id="enableNotifyBtn" class="btn-secondary" style="width:100%;padding:10px;">Enable notifications</button>
+      </div>
+      <div id="goalList" style="margin-top:8px;font-size:13px;color:var(--text-muted);"></div>
 
       <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;">
 
@@ -596,14 +615,17 @@
     const STORE_META = "meta";
     const STORE_RULES = "rules";
     const STORE_EVENTS = "events";
-    const STORE_PROFILE = "profile";       // long-term compressed user facts
-    const STORE_DOCS = "documents";        // uploaded local documents + chunks
-    const STORE_CHUNKS = "chunks";         // text chunks for RAG
+    const STORE_PROFILE = "profile";       // semantic long-term facts
+    const STORE_DOCS = "documents";
+    const STORE_CHUNKS = "chunks";
+    const STORE_EPISODES = "episodes";     // v5: structured micro-episodes
+    const STORE_GOALS = "goals";           // v5: proactive goal queue
+    const STORE_SKILLS = "skills";         // v5: declarative API skill schemas only (no eval)
 
-    // v4: profile + docs + chunks (vectors stored on chunk records)
+    // v5: dual-core memory + goals + declarative skills
     function openDB() {
       return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, 4);
+        const req = indexedDB.open(DB_NAME, 5);
         req.onupgradeneeded = (e) => {
           const db = e.target.result;
           if (!db.objectStoreNames.contains(STORE_MESSAGES)) {
@@ -627,6 +649,16 @@
           if (!db.objectStoreNames.contains(STORE_CHUNKS)) {
             const cs = db.createObjectStore(STORE_CHUNKS, { keyPath: "id", autoIncrement: true });
             cs.createIndex("docId", "docId", { unique: false });
+          }
+          if (!db.objectStoreNames.contains(STORE_EPISODES)) {
+            const es = db.createObjectStore(STORE_EPISODES, { keyPath: "id", autoIncrement: true });
+            es.createIndex("timestamp", "timestamp", { unique: false });
+          }
+          if (!db.objectStoreNames.contains(STORE_GOALS)) {
+            db.createObjectStore(STORE_GOALS, { keyPath: "id", autoIncrement: true });
+          }
+          if (!db.objectStoreNames.contains(STORE_SKILLS)) {
+            db.createObjectStore(STORE_SKILLS, { keyPath: "id", autoIncrement: true });
           }
         };
         req.onsuccess = () => resolve(req.result);
@@ -1029,15 +1061,62 @@
                 tx.oncomplete = () => resolve();
                 tx.onerror = () => reject(tx.error);
               });
-              console.log("[Bob v4] Idle: rules consolidated", rules.length, "→", res.rules.length);
+              console.log("[Bob v5] Idle: rules consolidated", rules.length, "→", res.rules.length);
+            }
+          }
+        } catch (_) {}
+
+        // 3. Failure analysis → rule synthesis (sleep cycle)
+        try {
+          const events = await loadRecentEvents(25);
+          const fails = events.filter(e => e.type === "tool_error" || e.type === "healing");
+          if (fails.length >= 3 && engine && !isGenerating) {
+            await maybeReflect();
+          }
+        } catch (_) {}
+
+        // 4. Proactive goals (opt-in via Settings)
+        try {
+          const proactiveOn = await getMeta("proactiveGoals", false);
+          if (proactiveOn) {
+            const goals = await listGoals();
+            const now = Date.now();
+            for (const g of goals) {
+              if (!g.enabled) continue;
+              const gap = g.schedule === "daily" ? 20 * 60 * 60 * 1000 : 2 * 60 * 60 * 1000;
+              if (now - (g.lastRun || 0) < gap) continue;
+              await touchGoal(g.id);
+              await notifyProactive(g.title);
+              // Surface a quiet system note if chat is open
+              if (!document.hidden) {
+                addMessage("system", `🎯 Goal pulse: ${g.title}`, null, true);
+              }
+              break; // one goal per idle pass
             }
           }
         } catch (_) {}
       } catch (err) {
-        console.warn("[Bob v4] Idle task error", err);
+        console.warn("[Bob v5] Idle task error", err);
       } finally {
         idleRunning = false;
       }
+    }
+
+    async function notifyProactive(title) {
+      try {
+        if (!("Notification" in window)) return;
+        if (Notification.permission === "default") {
+          // Don't prompt during idle — only if already granted
+          return;
+        }
+        if (Notification.permission === "granted") {
+          new Notification("Crazy Bob", {
+            body: title || "Background goal ready",
+            tag: "bob-goal",
+            silent: true
+          });
+        }
+      } catch (_) {}
     }
 
     function startIdleLoop() {
@@ -1125,6 +1204,192 @@
       } catch (err) {
         console.warn("[Bob] Auto-backup failed", err);
       }
+    }
+
+    // ========== Bob v5 Dual-Core Memory ==========
+    // Working memory slots (in-session), Episodes (IndexedDB), Semantic profile (existing)
+
+    let workingMemory = {
+      currentGoal: "",
+      activeProject: "",
+      mood: "neutral",
+      notes: ""
+    };
+
+    async function saveEpisode(ep) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_EPISODES, "readwrite");
+        const store = tx.objectStore(STORE_EPISODES);
+        store.add({
+          timestamp: ep.timestamp || Date.now(),
+          event: String(ep.event || "").slice(0, 200),
+          trigger: String(ep.trigger || "").slice(0, 240),
+          emotional_tone: String(ep.emotional_tone || "neutral").slice(0, 40),
+          utility_score: Math.max(0, Math.min(1, Number(ep.utility_score) || 0.5))
+        });
+        // Cap at ~200 episodes
+        store.getAllKeys().onsuccess = (e) => {
+          const keys = e.target.result || [];
+          if (keys.length > 200) {
+            for (let i = 0; i < keys.length - 200; i++) store.delete(keys[i]);
+          }
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function loadRecentEpisodes(limit = 12) {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_EPISODES, "readonly");
+        const req = tx.objectStore(STORE_EPISODES).getAll();
+        req.onsuccess = () => {
+          const rows = (req.result || []).sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+          resolve(rows);
+        };
+        req.onerror = () => resolve([]);
+      });
+    }
+
+    async function listGoals() {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_GOALS, "readonly");
+        const req = tx.objectStore(STORE_GOALS).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => resolve([]);
+      });
+    }
+
+    async function saveGoal(goal) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_GOALS, "readwrite");
+        tx.objectStore(STORE_GOALS).add({
+          title: String(goal.title || "").slice(0, 120),
+          schedule: goal.schedule || "daily", // daily | idle | once
+          lastRun: goal.lastRun || 0,
+          enabled: goal.enabled !== false,
+          created: Date.now()
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function touchGoal(id) {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_GOALS, "readwrite");
+        const store = tx.objectStore(STORE_GOALS);
+        const req = store.get(id);
+        req.onsuccess = () => {
+          const g = req.result;
+          if (g) {
+            g.lastRun = Date.now();
+            store.put(g);
+          }
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+    }
+
+    // Declarative skills only — never eval model-written JS
+    async function listSkills() {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_SKILLS, "readonly");
+        const req = tx.objectStore(STORE_SKILLS).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => resolve([]);
+      });
+    }
+
+    async function saveSkillSchema(skill) {
+      // skill: { name, description, urlTemplate, method, notes }
+      if (!skill?.name || !skill?.urlTemplate) return;
+      // Safety: only allow https URLs, no javascript:
+      if (!/^https:\/\//i.test(skill.urlTemplate) || /javascript:/i.test(skill.urlTemplate)) return;
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_SKILLS, "readwrite");
+        tx.objectStore(STORE_SKILLS).add({
+          name: String(skill.name).slice(0, 60),
+          description: String(skill.description || "").slice(0, 200),
+          urlTemplate: String(skill.urlTemplate).slice(0, 300),
+          method: (skill.method || "GET").toUpperCase() === "POST" ? "POST" : "GET",
+          notes: String(skill.notes || "").slice(0, 200),
+          created: Date.now()
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    // Parse MemGPT-style memory edits from model output
+    async function applyMemoryEdits(text) {
+      if (!text) return text;
+      const re = /<memory_edit\s+action="(append|replace|set_slot)"\s+target="([^"]+)">([\s\S]*?)<\/memory_edit>/gi;
+      let m;
+      let cleaned = text;
+      while ((m = re.exec(text)) !== null) {
+        const action = m[1];
+        const target = m[2].toLowerCase();
+        const body = m[3].trim();
+        cleaned = cleaned.replace(m[0], "");
+        try {
+          if (target === "user_profile" || target === "profile") {
+            if (action === "replace") {
+              await setUserProfile(body);
+            } else {
+              const cur = await getUserProfile();
+              await setUserProfile((cur ? cur + "\n" : "") + body);
+            }
+            await saveEpisode({
+              event: "Profile memory edit",
+              trigger: body.slice(0, 160),
+              emotional_tone: "learning",
+              utility_score: 0.9
+            });
+          } else if (target === "working_goal" || target === "goal") {
+            workingMemory.currentGoal = body.slice(0, 120);
+          } else if (target === "project") {
+            workingMemory.activeProject = body.slice(0, 120);
+          } else if (target === "mood") {
+            workingMemory.mood = body.slice(0, 40);
+          } else if (target === "episode") {
+            await saveEpisode({
+              event: body.slice(0, 200),
+              trigger: "model_memory_edit",
+              emotional_tone: "noted",
+              utility_score: 0.7
+            });
+          }
+        } catch (err) {
+          console.warn("[Bob v5] memory_edit failed", err);
+        }
+      }
+      return cleaned.trim();
+    }
+
+    async function buildWorkingMemoryBlock() {
+      const parts = [];
+      if (userName) parts.push(`User name: ${userName}`);
+      if (workingMemory.currentGoal) parts.push(`Current goal: ${workingMemory.currentGoal}`);
+      if (workingMemory.activeProject) parts.push(`Active project: ${workingMemory.activeProject}`);
+      if (workingMemory.mood && workingMemory.mood !== "neutral") parts.push(`Mood context: ${workingMemory.mood}`);
+      try {
+        const eps = await loadRecentEpisodes(6);
+        if (eps.length) {
+          parts.push("Recent episodes:\n" + eps.map(e =>
+            `- ${new Date(e.timestamp).toLocaleDateString()}: ${e.event}${e.trigger ? " (" + e.trigger + ")" : ""}`
+          ).join("\n"));
+        }
+      } catch (_) {}
+      return parts.length ? "Working memory:\n" + parts.join("\n") : "";
     }
 
     // Background compression: when history is about to be trimmed, summarise the oldest part into the permanent profile
@@ -1589,11 +1854,16 @@ Before answering, think step-by-step inside <think>...</think> tags.
 Write your internal reasoning first, then close the tag and give the final answer to the user.
 Never show the <think> tags or the reasoning content in the final answer itself.
 
+Memory self-edit (optional, rare):
+If you learn a durable fact about the user, you may emit ONE tag (hidden from the user answer):
+<memory_edit action="append" target="user_profile">fact here</memory_edit>
+Targets: user_profile, episode, working_goal, project, mood. Do not spam edits.
+
 You excel at:
 - Discussing personal and practical problems with empathy and good judgment.
 - Writing high-quality letters, emails and formal messages.
 - Giving clear step-by-step advice.
-- Using the long-term user profile and any uploaded documents when relevant.
+- Using long-term profile, working memory, episodes, and uploaded documents when relevant.
 - Summarising research, news, weather, currency, crypto and web results when the user triggers those tools.
 
 Formatting: Use markdown when it helps (short lists, **bold** for emphasis, code blocks for code or addresses). Keep replies readable on a phone screen — not walls of text.
@@ -1610,10 +1880,14 @@ Be concise when appropriate, thorough when needed. Ask clarifying questions if i
         }
       } catch (_) {}
 
-      // Long-term profile + document RAG
+      // Long-term profile + document RAG + working memory
       let ragRaw = "";
       try {
         ragRaw = await buildRAGContext(userQuery || "") || "";
+      } catch (_) {}
+      try {
+        const wm = await buildWorkingMemoryBlock();
+        if (wm) ragRaw = (wm + "\n\n" + ragRaw).trim();
       } catch (_) {}
 
       // Apply hierarchical token budget
@@ -2167,6 +2441,8 @@ Your job is to improve the result:
             full += delta;
             updateStreaming(div, full);
           }
+          // Apply MemGPT-style memory edits, then strip them from visible/history text
+          full = await applyMemoryEdits(full);
           messages.push({ role: "assistant", content: full });
           await saveMessages(messages);
           finalizeAssistantMessage(div, full);
@@ -2174,6 +2450,15 @@ Your job is to improve the result:
           if (answer) {
             speakText(answer);
             maybeContinueListening();
+          }
+          // Log a lightweight episode for important user turns
+          if (text.length > 40) {
+            saveEpisode({
+              event: "User request handled",
+              trigger: text.slice(0, 160),
+              emotional_tone: "conversation",
+              utility_score: 0.4
+            }).catch(() => {});
           }
           // Opportunistic self-reflection after some activity
           maybeReflect().catch(() => {});
@@ -3183,6 +3468,64 @@ Source: CoinGecko`;
         await setUserProfile(updated.trim());
         alert(updated.trim() ? "Profile saved." : "Profile cleared.");
       }
+    });
+
+    document.getElementById("viewEpisodesBtn")?.addEventListener("click", async () => {
+      const eps = await loadRecentEpisodes(15);
+      if (!eps.length) {
+        alert("No episodes stored yet. They appear as you chat and when Bob learns facts.");
+        return;
+      }
+      alert(eps.map(e =>
+        `• ${new Date(e.timestamp).toLocaleString()}\n  ${e.event}${e.trigger ? "\n  → " + e.trigger : ""}`
+      ).join("\n\n"));
+    });
+
+    document.getElementById("proactiveGoals")?.addEventListener("change", async (e) => {
+      await setMeta("proactiveGoals", !!e.target.checked);
+    });
+
+    async function refreshGoalList() {
+      const el = document.getElementById("goalList");
+      if (!el) return;
+      const goals = await listGoals();
+      if (!goals.length) {
+        el.innerHTML = "<em>No goals yet. Add one above.</em>";
+        return;
+      }
+      el.innerHTML = goals.map(g =>
+        `<div style="padding:4px 0;border-bottom:1px solid var(--border);">🎯 ${escapeHtml(g.title)} <span style="opacity:.6">(${g.schedule})</span></div>`
+      ).join("");
+    }
+
+    document.getElementById("addGoalBtn")?.addEventListener("click", async () => {
+      const title = prompt("Goal title (e.g. Check morning headlines, Remind feeder inventory)");
+      if (!title || !title.trim()) return;
+      await saveGoal({ title: title.trim(), schedule: "daily", enabled: true });
+      await setMeta("proactiveGoals", true);
+      const pg = document.getElementById("proactiveGoals");
+      if (pg) pg.checked = true;
+      refreshGoalList();
+      alert("Goal saved. Proactive mode is on.");
+    });
+
+    document.getElementById("enableNotifyBtn")?.addEventListener("click", async () => {
+      if (!("Notification" in window)) {
+        alert("Notifications not supported in this browser.");
+        return;
+      }
+      const perm = await Notification.requestPermission();
+      alert(perm === "granted" ? "Notifications enabled." : "Permission: " + perm);
+    });
+
+    // Restore proactive toggle when settings open
+    settingsBtn?.addEventListener("click", async () => {
+      try {
+        const on = await getMeta("proactiveGoals", false);
+        const el = document.getElementById("proactiveGoals");
+        if (el) el.checked = !!on;
+        refreshGoalList();
+      } catch (_) {}
     });
 
     document.getElementById("uploadDocBtn")?.addEventListener("click", () => {
