@@ -376,10 +376,12 @@
 
   <div class="model-bar">
     <select id="modelSelect">
-      <option value="SmolLM2-360M-Instruct-q4f16_1-MLC">SmolLM2 360M (fastest)</option>
-      <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC" selected>Llama 3.2 1B (recommended)</option>
-      <option value="Qwen2.5-0.5B-Instruct-q4f16_1-MLC">Qwen2.5 0.5B</option>
-      <option value="Llama-3.2-3B-Instruct-q4f16_1-MLC">Llama 3.2 3B (best quality)</option>
+      <option value="SmolLM2-360M-Instruct-q4f16_1-MLC" selected>SmolLM2 360M (safest / fastest)</option>
+      <option value="Qwen2.5-0.5B-Instruct-q4f16_1-MLC">Qwen2.5 0.5B (light)</option>
+      <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC">Llama 3.2 1B (balanced)</option>
+      <option value="Llama-3.2-1B-Instruct-q4f32_1-MLC">Llama 3.2 1B q4f32 (no f16 needed)</option>
+      <option value="Qwen2.5-1.5B-Instruct-q4f16_1-MLC">Qwen2.5 1.5B</option>
+      <option value="Llama-3.2-3B-Instruct-q4f16_1-MLC">Llama 3.2 3B (heavy — may crash on iPhone)</option>
     </select>
     <button id="loadBtn">Load</button>
   </div>
@@ -536,7 +538,22 @@
         <button type="button" id="importMemoryBtn" class="btn-secondary" style="width:100%;padding:10px;">Import memory (JSON)</button>
         <input type="file" id="importMemoryFile" accept=".json,application/json" style="display:none;">
       </div>
-      <p class="settings-hint">Export saves chat + learned rules + event logs. Import restores them. Use this to keep growing past browser limits or move to another device.</p>
+      <p class="settings-hint">Export saves chat + learned rules + event logs + profile. Import restores them. Use this to keep growing past browser limits or move to another device.</p>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;">
+
+      <h3 style="font-size:15px;margin-bottom:10px;">Long-term memory & documents</h3>
+      <p class="settings-hint" style="margin-bottom:10px;">
+        Bob compresses old chats into a permanent User Profile. You can also upload local text or PDF files for offline RAG.
+      </p>
+      <div class="settings-row" style="margin-top:6px;">
+        <button type="button" id="viewProfileBtn" class="btn-secondary" style="width:100%;padding:10px;">View / edit User Profile</button>
+      </div>
+      <div class="settings-row" style="margin-top:8px;">
+        <button type="button" id="uploadDocBtn" class="btn-secondary" style="width:100%;padding:10px;">Upload document (txt / md / pdf)</button>
+        <input type="file" id="docFileInput" accept=".txt,.md,.text,.pdf,text/plain,application/pdf" style="display:none;" multiple>
+      </div>
+      <div id="docList" style="margin-top:10px;font-size:13px;color:var(--text-muted);"></div>
 
       <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;">
 
@@ -567,7 +584,7 @@
   </div>
 
   <script type="module">
-    import { CreateMLCEngine } from "https://esm.run/@mlc-ai/web-llm@0.2.79";
+    import { CreateMLCEngine, prebuiltAppConfig } from "https://esm.run/@mlc-ai/web-llm@0.2.79";
 
     // ---------- IndexedDB helpers (persistent memory + self-improvement) ----------
     const DB_NAME = "crazy-bob-db";
@@ -576,10 +593,14 @@
     const STORE_META = "meta";
     const STORE_RULES = "rules";
     const STORE_EVENTS = "events";
+    const STORE_PROFILE = "profile";       // long-term compressed user facts
+    const STORE_DOCS = "documents";        // uploaded local documents + chunks
+    const STORE_CHUNKS = "chunks";         // text chunks for RAG
 
+    // v4: profile + docs + chunks (vectors stored on chunk records)
     function openDB() {
       return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        const req = indexedDB.open(DB_NAME, 4);
         req.onupgradeneeded = (e) => {
           const db = e.target.result;
           if (!db.objectStoreNames.contains(STORE_MESSAGES)) {
@@ -594,6 +615,16 @@
           if (!db.objectStoreNames.contains(STORE_EVENTS)) {
             db.createObjectStore(STORE_EVENTS, { keyPath: "id", autoIncrement: true });
           }
+          if (!db.objectStoreNames.contains(STORE_PROFILE)) {
+            db.createObjectStore(STORE_PROFILE, { keyPath: "key" });
+          }
+          if (!db.objectStoreNames.contains(STORE_DOCS)) {
+            db.createObjectStore(STORE_DOCS, { keyPath: "id", autoIncrement: true });
+          }
+          if (!db.objectStoreNames.contains(STORE_CHUNKS)) {
+            const cs = db.createObjectStore(STORE_CHUNKS, { keyPath: "id", autoIncrement: true });
+            cs.createIndex("docId", "docId", { unique: false });
+          }
         };
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
@@ -601,12 +632,16 @@
     }
 
     async function saveMessages(msgs) {
+      // Trigger long-term compression if history is getting large
+      if (msgs.length > 420) {
+        compressOldHistoryIfNeeded(msgs).catch(() => {});
+      }
       const db = await openDB();
       return new Promise((resolve, reject) => {
         const tx = db.transaction([STORE_MESSAGES, STORE_META], "readwrite");
         const store = tx.objectStore(STORE_MESSAGES);
         store.clear();
-        // Keep last ~400 messages (raised for long-term growth)
+        // Keep last ~400 messages; older ones are compressed into the permanent User Profile
         const toSave = msgs.slice(-400);
         toSave.forEach((m, i) => store.add({ id: i + 1, role: m.role, content: m.content, agent: m.agent || null }));
         tx.objectStore(STORE_META).put({ key: "lastSaved", value: Date.now() });
@@ -771,6 +806,475 @@
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
       });
+    }
+
+    // ========== Bob v4 Omni-Agent Engine ==========
+    // Web Worker bridge, Token Budgeter, Semantic RAG, Proactive Idle Loop
+
+    let bobWorker = null;
+    let workerReady = false;
+    let embedderReady = false;
+    const pendingWorker = new Map();
+    let workerMsgId = 1;
+
+    function initWorker() {
+      try {
+        bobWorker = new Worker("./bob-worker.js", { type: "module" });
+        bobWorker.onmessage = (e) => {
+          const msg = e.data || {};
+          if (msg.type === "worker_ready") {
+            workerReady = true;
+            console.log("[Bob v4] Worker ready");
+            return;
+          }
+          if (msg.type === "embed_ready") {
+            embedderReady = true;
+            console.log("[Bob v4] Embedder ready (all-MiniLM-L6-v2)");
+            return;
+          }
+          if (msg.type === "embed_progress") {
+            // optional UI progress later
+            return;
+          }
+          if (msg.id && pendingWorker.has(msg.id)) {
+            const { resolve, reject } = pendingWorker.get(msg.id);
+            pendingWorker.delete(msg.id);
+            if (msg.type === "error") reject(new Error(msg.error));
+            else resolve(msg);
+          }
+        };
+        bobWorker.onerror = (err) => {
+          console.warn("[Bob v4] Worker error", err);
+          workerReady = false;
+        };
+      } catch (err) {
+        console.warn("[Bob v4] Worker unavailable, falling back to main thread", err);
+        bobWorker = null;
+      }
+    }
+
+    function workerCall(type, payload = {}, timeoutMs = 60000) {
+      return new Promise((resolve, reject) => {
+        if (!bobWorker || !workerReady) {
+          reject(new Error("Worker not ready"));
+          return;
+        }
+        const id = workerMsgId++;
+        pendingWorker.set(id, { resolve, reject });
+        bobWorker.postMessage({ id, type, payload });
+        setTimeout(() => {
+          if (pendingWorker.has(id)) {
+            pendingWorker.delete(id);
+            reject(new Error("Worker timeout: " + type));
+          }
+        }, timeoutMs);
+      });
+    }
+
+    // --- Token Budgeter (Upgrade C) ---
+    // Approximate tokens ≈ words * 1.3 (good enough for budgeting)
+    function estimateTokens(text) {
+      if (!text) return 0;
+      return Math.ceil(String(text).split(/\s+/).filter(Boolean).length * 1.3);
+    }
+
+    function truncateToTokens(text, maxTokens) {
+      if (!text) return "";
+      const words = String(text).split(/\s+/);
+      const maxWords = Math.max(10, Math.floor(maxTokens / 1.3));
+      if (words.length <= maxWords) return text;
+      return words.slice(0, maxWords).join(" ") + " …";
+    }
+
+    const TOKEN_BUDGET = {
+      total: 4096,
+      systemCore: 600,      // personality + base instructions
+      ragProfile: 1200,     // user profile + retrieved chunks
+      rules: 400,           // learned rules
+      history: 1500,        // recent chat
+      generation: 396       // reserved for output
+    };
+
+    function budgetContext({ systemCore, rag, rules, historyMessages }) {
+      // Returns trimmed pieces that fit the hierarchical budget
+      let sys = truncateToTokens(systemCore || "", TOKEN_BUDGET.systemCore);
+      let ragText = truncateToTokens(rag || "", TOKEN_BUDGET.ragProfile);
+      let rulesText = truncateToTokens(rules || "", TOKEN_BUDGET.rules);
+
+      // History: keep newest messages that fit remaining budget
+      const histBudget = TOKEN_BUDGET.history;
+      const trimmedHistory = [];
+      let used = 0;
+      for (let i = (historyMessages || []).length - 1; i >= 0; i--) {
+        const m = historyMessages[i];
+        const t = estimateTokens(m.content || "");
+        if (used + t > histBudget) break;
+        trimmedHistory.unshift(m);
+        used += t;
+      }
+      return { systemCore: sys, rag: ragText, rules: rulesText, history: trimmedHistory };
+    }
+
+    // --- Semantic helpers ---
+    function cosineSim(a, b) {
+      if (!a || !b || a.length !== b.length) return 0;
+      let dot = 0, na = 0, nb = 0;
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+      }
+      const denom = Math.sqrt(na) * Math.sqrt(nb);
+      return denom ? dot / denom : 0;
+    }
+
+    async function embedTextsMain(texts) {
+      // Prefer worker; fall back to main-thread Transformers if needed
+      try {
+        if (workerReady) {
+          const res = await workerCall("embed", { texts }, 120000);
+          if (res.ok && res.vectors) return res.vectors;
+        }
+      } catch (_) {}
+      // Main-thread fallback (heavier but works)
+      try {
+        const { pipeline, env } = await import("https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2");
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+        const pipe = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { quantized: true });
+        const vectors = [];
+        for (const t of texts) {
+          const out = await pipe(t, { pooling: "mean", normalize: true });
+          vectors.push(Array.from(out.data));
+        }
+        embedderReady = true;
+        return vectors;
+      } catch (err) {
+        console.warn("[Bob v4] Embedding failed, keyword fallback", err);
+        return null;
+      }
+    }
+
+    async function updateChunkVectors(chunkIds, texts) {
+      const vectors = await embedTextsMain(texts);
+      if (!vectors) return;
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_CHUNKS, "readwrite");
+        const store = tx.objectStore(STORE_CHUNKS);
+        chunkIds.forEach((id, i) => {
+          const getReq = store.get(id);
+          getReq.onsuccess = () => {
+            const rec = getReq.result;
+            if (rec) {
+              rec.vector = vectors[i];
+              store.put(rec);
+            }
+          };
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    // Proactive Idle Engine (Upgrade D)
+    let lastUserActivity = Date.now();
+    let idleTimer = null;
+    let idleRunning = false;
+
+    function touchActivity() {
+      lastUserActivity = Date.now();
+    }
+
+    async function runIdleTasks() {
+      if (idleRunning || isGenerating || !engine) return;
+      if (Date.now() - lastUserActivity < 45000) return;
+      // Don't fight the LLM for memory while embedder is still starting
+      if (!embedderReady && !embedderInitStarted) return;
+      idleRunning = true;
+      try {
+        // 1. Index a few chunks missing vectors (small batches only)
+        const db = await openDB();
+        const chunks = await new Promise((resolve) => {
+          const tx = db.transaction(STORE_CHUNKS, "readonly");
+          const req = tx.objectStore(STORE_CHUNKS).getAll();
+          req.onsuccess = () => resolve(req.result || []);
+          req.onerror = () => resolve([]);
+        });
+        const missing = chunks.filter(c => !c.vector && c.text).slice(0, 3);
+        if (missing.length && embedderReady) {
+          console.log("[Bob v4] Idle: embedding", missing.length, "chunks");
+          await updateChunkVectors(missing.map(c => c.id), missing.map(c => c.text.slice(0, 400)));
+        }
+
+        // 2. Consolidate rules via worker
+        try {
+          const rules = await loadRules(50);
+          if (rules.length > 8 && workerReady) {
+            const res = await workerCall("consolidate_rules", { rules });
+            if (res.rules && res.rules.length < rules.length) {
+              // Rebuild rules store with consolidated list
+              const dbr = await openDB();
+              await new Promise((resolve, reject) => {
+                const tx = dbr.transaction(STORE_RULES, "readwrite");
+                tx.objectStore(STORE_RULES).clear();
+                res.rules.forEach(text => tx.objectStore(STORE_RULES).add({ text, created: Date.now() }));
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+              });
+              console.log("[Bob v4] Idle: rules consolidated", rules.length, "→", res.rules.length);
+            }
+          }
+        } catch (_) {}
+      } catch (err) {
+        console.warn("[Bob v4] Idle task error", err);
+      } finally {
+        idleRunning = false;
+      }
+    }
+
+    function startIdleLoop() {
+      if (idleTimer) return;
+      idleTimer = setInterval(() => {
+        if (document.hidden) return;
+        runIdleTasks().catch(() => {});
+      }, 15000);
+      ["pointerdown", "keydown", "touchstart", "scroll"].forEach(ev => {
+        window.addEventListener(ev, touchActivity, { passive: true });
+      });
+    }
+
+    // Boot worker lightly — DO NOT load embedder until LLM is ready (avoids iOS memory crash)
+    initWorker();
+    setTimeout(() => startIdleLoop(), 3000);
+
+    let embedderInitStarted = false;
+    function maybeInitEmbedder() {
+      if (embedderInitStarted || !engine) return;
+      embedderInitStarted = true;
+      // Delay so LLM can settle in memory first
+      setTimeout(() => {
+        if (workerReady) {
+          workerCall("init_embedder", {}, 180000).catch((err) => {
+            console.warn("[Bob v4] Embedder init deferred/failed (keyword RAG still works)", err);
+          });
+        }
+      }, 8000);
+    }
+
+    // ---------- Long-Term User Profile (Episodic Compression) ----------
+    async function getUserProfile() {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_PROFILE, "readonly");
+        const req = tx.objectStore(STORE_PROFILE).get("main");
+        req.onsuccess = () => resolve(req.result ? req.result.text : "");
+        req.onerror = () => resolve("");
+      });
+    }
+
+    async function setUserProfile(text) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_PROFILE, "readwrite");
+        tx.objectStore(STORE_PROFILE).put({ key: "main", text: text || "", updated: Date.now() });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    // Background compression: when history is about to be trimmed, summarise the oldest part into the permanent profile
+    let isCompressing = false;
+    async function compressOldHistoryIfNeeded(allMsgs) {
+      if (!engine || isCompressing || allMsgs.length < 420) return;
+      isCompressing = true;
+      try {
+        const toCompress = allMsgs.slice(0, allMsgs.length - 380); // oldest chunk
+        if (toCompress.length < 30) return;
+
+        const existingProfile = await getUserProfile();
+        const transcript = toCompress.map(m => {
+          const who = m.role === "user" ? "User" : (m.agent || "Bob");
+          const clean = (typeof parseCoT === "function" ? parseCoT(m.content).answer : m.content) || m.content;
+          return `${who}: ${String(clean).slice(0, 400)}`;
+        }).join("\n").slice(0, 6000);
+
+        const prompt = `You are updating a permanent long-term user profile for a private on-device AI.
+Existing profile:
+${existingProfile || "(empty)"}
+
+New conversation history that is about to be archived:
+${transcript}
+
+Extract and merge ONLY durable facts: name, location, preferences, ongoing projects, important relationships, goals, technical setup, recurring topics.
+Write a clean, concise third-person profile (max 450 words). Keep previous important facts. Do not invent. Output ONLY the updated profile text.`;
+
+        const chunks = await engine.chat.completions.create({
+          messages: [
+            { role: "system", content: "You maintain a concise long-term user profile. Output only the profile." },
+            { role: "user", content: prompt }
+          ],
+          stream: false,
+          temperature: 0.3,
+          max_tokens: 550
+        });
+        const newProfile = (chunks.choices?.[0]?.message?.content || "").trim();
+        if (newProfile.length > 40) {
+          await setUserProfile(newProfile);
+          console.log("[Crazy Bob] Long-term profile updated");
+        }
+      } catch (err) {
+        console.warn("Profile compression failed", err);
+      } finally {
+        isCompressing = false;
+      }
+    }
+
+    // ---------- Local Documents & Offline RAG ----------
+    async function saveDocument(doc) {
+      // doc: { name, type, text, added }
+      const db = await openDB();
+      const chunkTexts = chunkText(doc.text || "", 700, 80);
+      const newChunkIds = [];
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction([STORE_DOCS, STORE_CHUNKS], "readwrite");
+        const docStore = tx.objectStore(STORE_DOCS);
+        const req = docStore.add({
+          name: doc.name,
+          type: doc.type || "text",
+          added: doc.added || Date.now(),
+          charCount: (doc.text || "").length
+        });
+        req.onsuccess = () => {
+          const docId = req.result;
+          const chunkStore = tx.objectStore(STORE_CHUNKS);
+          chunkTexts.forEach((c, i) => {
+            const addReq = chunkStore.add({ docId, name: doc.name, index: i, text: c });
+            addReq.onsuccess = () => newChunkIds.push(addReq.result);
+          });
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+      // Vectors are filled by the idle loop after LLM is stable (avoids crash on upload)
+    }
+
+    function chunkText(text, size = 700, overlap = 80) {
+      const clean = String(text || "").replace(/\s+/g, " ").trim();
+      if (!clean) return [];
+      const chunks = [];
+      let i = 0;
+      while (i < clean.length) {
+        chunks.push(clean.slice(i, i + size));
+        i += size - overlap;
+      }
+      return chunks;
+    }
+
+    async function listDocuments() {
+      const db = await openDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_DOCS, "readonly");
+        const req = tx.objectStore(STORE_DOCS).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => resolve([]);
+      });
+    }
+
+    async function deleteDocument(docId) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction([STORE_DOCS, STORE_CHUNKS], "readwrite");
+        tx.objectStore(STORE_DOCS).delete(docId);
+        const idx = tx.objectStore(STORE_CHUNKS).index("docId");
+        const req = idx.getAllKeys(docId);
+        req.onsuccess = () => {
+          (req.result || []).forEach(k => tx.objectStore(STORE_CHUNKS).delete(k));
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    // Bob v4 Semantic RAG — cosine similarity when vectors exist, keyword hybrid fallback
+    async function retrieveRelevantChunks(query, maxChunks = 5) {
+      const db = await openDB();
+      const allChunks = await new Promise((resolve) => {
+        const tx = db.transaction(STORE_CHUNKS, "readonly");
+        const req = tx.objectStore(STORE_CHUNKS).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => resolve([]);
+      });
+      if (!allChunks.length) return [];
+
+      // Try semantic search via worker / embeddings
+      try {
+        const hasVectors = allChunks.some(c => c.vector && c.vector.length);
+        if (hasVectors || embedderReady || workerReady) {
+          let queryVector = null;
+          const vecs = await embedTextsMain([query.slice(0, 400)]);
+          if (vecs && vecs[0]) queryVector = vecs[0];
+
+          if (queryVector) {
+            const scored = allChunks
+              .filter(c => c.vector)
+              .map(c => ({ ...c, score: cosineSim(queryVector, c.vector) }))
+              .filter(c => c.score > 0.28)
+              .sort((a, b) => b.score - a.score)
+              .slice(0, maxChunks);
+            if (scored.length) return scored;
+          }
+
+          // Worker path
+          if (workerReady) {
+            try {
+              const res = await workerCall("semantic_search", {
+                query,
+                chunks: allChunks.map(c => ({ id: c.id, text: c.text, name: c.name, vector: c.vector })),
+                queryVector,
+                max: maxChunks
+              });
+              if (res.results?.length) return res.results;
+            } catch (_) {}
+          }
+        }
+      } catch (err) {
+        console.warn("[Bob v4] Semantic retrieve fallback", err);
+      }
+
+      // Keyword hybrid fallback (always available)
+      const q = query.toLowerCase();
+      const terms = q.split(/[^a-z0-9\u0e00-\u0e7f]+/).filter(t => t.length > 2);
+      if (!terms.length) return allChunks.slice(0, maxChunks);
+
+      return allChunks.map(c => {
+        const t = (c.text || "").toLowerCase();
+        let score = 0;
+        for (const term of terms) {
+          if (t.includes(term)) score += 2;
+          const m = t.match(new RegExp(term, "gi"));
+          if (m) score += Math.min(m.length, 3);
+        }
+        return { ...c, score };
+      }).filter(c => c.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, maxChunks);
+    }
+
+    async function buildRAGContext(userQuery) {
+      const parts = [];
+      try {
+        const profile = await getUserProfile();
+        if (profile && profile.length > 20) {
+          parts.push("Long-term user profile (permanent memory):\n" + profile.slice(0, 1200));
+        }
+        const chunks = await retrieveRelevantChunks(userQuery, 4);
+        if (chunks.length) {
+          const docText = chunks.map(c => `[From: ${c.name}]\n${c.text}`).join("\n\n");
+          parts.push("Relevant excerpts from your documents:\n" + docText.slice(0, 1800));
+        }
+      } catch (_) {}
+      return parts.join("\n\n");
     }
 
     // ---------- DOM ----------
@@ -1013,22 +1517,13 @@
       witty: "Be extra witty, playfully sarcastic and sharp, while still remaining helpful and kind."
     };
 
-    async function buildSingleSystem() {
+    async function buildSingleSystem(userQuery = "") {
       const nameLine = userName
         ? `The user's name is ${userName}. Always address them as ${userName} in a natural, friendly way.`
         : `You do not know the user's name yet. In your first reply, warmly ask what their name is. Once they tell you, use it from then on.`;
       const style = personalityStyles[personality] || personalityStyles.classic;
 
-      // Load learned self-improvement rules
-      let rulesBlock = "";
-      try {
-        const rules = await loadRules(18);
-        if (rules.length) {
-          rulesBlock = "\n\nLearned operational rules (follow these):\n" + rules.map((r, i) => `${i + 1}. ${r}`).join("\n");
-        }
-      } catch (_) {}
-
-      return `You are Crazy Bob – a helpful AI assistant running privately on the user's device (no cloud for chat).
+      const core = `You are Crazy Bob – a helpful AI assistant running privately on the user's device (no cloud for chat).
 ${nameLine}
 ${style}
 
@@ -1041,12 +1536,41 @@ You excel at:
 - Discussing personal and practical problems with empathy and good judgment.
 - Writing high-quality letters, emails and formal messages.
 - Giving clear step-by-step advice.
+- Using the long-term user profile and any uploaded documents when relevant.
 - Summarising research, news, weather, currency, crypto and web results when the user triggers those tools.
 
 Formatting: Use markdown when it helps (short lists, **bold** for emphasis, code blocks for code or addresses). Keep replies readable on a phone screen — not walls of text.
 
 You can see the conversation history, so use past context when relevant.
-Be concise when appropriate, thorough when needed. Ask clarifying questions if important details are missing.${rulesBlock}`;
+Be concise when appropriate, thorough when needed. Ask clarifying questions if important details are missing.`;
+
+      // Load learned rules
+      let rulesRaw = "";
+      try {
+        const rules = await loadRules(18);
+        if (rules.length) {
+          rulesRaw = "Learned operational rules (follow these):\n" + rules.map((r, i) => `${i + 1}. ${r}`).join("\n");
+        }
+      } catch (_) {}
+
+      // Long-term profile + document RAG
+      let ragRaw = "";
+      try {
+        ragRaw = await buildRAGContext(userQuery || "") || "";
+      } catch (_) {}
+
+      // Apply hierarchical token budget
+      const budgeted = budgetContext({
+        systemCore: core,
+        rag: ragRaw,
+        rules: rulesRaw,
+        historyMessages: [] // history applied separately in sendMessage
+      });
+
+      let out = budgeted.systemCore;
+      if (budgeted.rules) out += "\n\n" + budgeted.rules;
+      if (budgeted.rag) out += "\n\n" + budgeted.rag;
+      return out;
     }
 
     function buildAgentPrompt(agentKey) {
@@ -1356,26 +1880,43 @@ Your job is to improve the result:
       progressText.textContent = auto ? "Opening cached model…" : "Starting…";
 
       try {
+        // WebGPU check with clearer message
         if (!navigator.gpu) {
-          throw new Error("WebGPU not available. Use Safari 26+ or recent Chrome on iOS.");
+          throw new Error("WebGPU not available. On iPhone use Safari 18+ / iOS 18+ (or Chrome). Older Safari cannot run local models.");
+        }
+
+        // Unload previous engine to free VRAM before loading a new one
+        if (engine) {
+          try {
+            if (typeof engine.unload === "function") await engine.unload();
+          } catch (_) {}
+          engine = null;
+          // Give Safari a moment to release GPU memory
+          await new Promise(r => setTimeout(r, 400));
+        }
+
+        // Warn on heavy models
+        if (/3B/i.test(selected)) {
+          progressText.textContent = "Large model — may fail on phones with low RAM…";
         }
 
         engine = await CreateMLCEngine(selected, {
           initProgressCallback: (report) => {
             const pct = Math.round((report.progress || 0) * 100);
-            progressFill.style.width = pct + "%";
-            // WebLLM reports cache hits in the text
+            progressFill.style.width = Math.min(100, pct) + "%";
             const text = report.text || `${pct}%`;
-            progressText.textContent = text;
+            progressText.textContent = text.length > 80 ? text.slice(0, 77) + "…" : text;
             if (/cache|Cached|fetching cache/i.test(text)) {
               setStatus("loading", "Loading from cache…");
+            } else if (/download|fetch|Loading/i.test(text)) {
+              setStatus("loading", "Downloading model weights…");
             }
           }
         });
 
         await setLastModel(selected);
 
-        setStatus("ready", "Ready · history saved");
+        setStatus("ready", "Ready");
         progressWrap.classList.remove("visible");
         loadBtn.textContent = "Reload";
         loadBtn.classList.remove("loading");
@@ -1386,6 +1927,9 @@ Your job is to improve the result:
         micBtn.disabled = false;
         quickActions.classList.add("visible");
         userInput.focus();
+
+        // Only now start embedder (after LLM is stable)
+        maybeInitEmbedder();
 
         // Load name + previously saved chat
         try {
@@ -1405,14 +1949,26 @@ Your job is to improve the result:
           addMessage("system", "Crazy Bob is awake!", null, true);
         }
       } catch (err) {
-        console.error(err);
+        console.error("[Bob] loadModel failed", err);
+        engine = null;
+        const msg = err?.message || String(err);
+        let hint = msg;
+        if (/WebGPU|gpu/i.test(msg)) {
+          hint = "WebGPU missing. Use a recent Safari/Chrome on iPhone.";
+        } else if (/memory|OOM|out of memory|Failed to allocate/i.test(msg)) {
+          hint = "Out of memory. Try SmolLM2 360M or Qwen 0.5B, close other tabs, and reload.";
+        } else if (/fetch|network|Failed to fetch|Load failed/i.test(msg)) {
+          hint = "Network/download failed. Check connection and try again (model is cached after first success).";
+        } else if (/shader-f16|f16/i.test(msg)) {
+          hint = "This device may lack float16 shaders. Try the 'Llama 3.2 1B q4f32' option.";
+        }
         setStatus("error", "Failed to load");
-        progressText.textContent = err.message || String(err);
+        progressText.textContent = hint;
         loadBtn.textContent = "Retry";
         loadBtn.classList.remove("loading");
         loadBtn.disabled = false;
         modelSelect.disabled = false;
-        addMessage("system", "Error: " + (err.message || err), null, true);
+        addMessage("system", "Model load failed: " + hint + "\n\nTip: start with SmolLM2 360M (safest).", null, true);
       }
     }
 
@@ -1512,10 +2068,18 @@ Your job is to improve the result:
               return { role: m.role, content: clean };
             });
 
-          const systemPrompt = await buildSingleSystem();
+          const systemPrompt = await buildSingleSystem(text);
+          // Hierarchical token budget on history (keep newest that fit)
+          const budgetedHist = budgetContext({
+            systemCore: "",
+            rag: "",
+            rules: "",
+            historyMessages: historyForModel
+          }).history;
+
           const singleMessages = [
             { role: "system", content: systemPrompt },
-            ...historyForModel
+            ...budgetedHist
           ];
 
           const div = addMessage("assistant", "", null, true);
@@ -2360,14 +2924,18 @@ Source: CoinGecko`;
       try {
         const rules = await loadRules(200);
         const events = await loadRecentEvents(500);
+        const profile = await getUserProfile();
+        const docs = await listDocuments();
         const payload = {
-          version: 1,
+          version: 2,
           exportedAt: new Date().toISOString(),
           userName: userName || null,
           personality: personality || "classic",
           messages: messages,
           rules: rules,
-          events: events
+          events: events,
+          profile: profile,
+          documents: docs
         };
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
         const a = document.createElement("a");
@@ -2429,8 +2997,14 @@ Source: CoinGecko`;
           if (persEl) persEl.value = personality;
         }
 
-        addMessage("system", `Memory imported: ${messages.length} messages, rules restored. Bob continues from here.`, null, true);
+        // Restore long-term profile
+        if (typeof data.profile === "string" && data.profile.length > 10) {
+          await setUserProfile(data.profile);
+        }
+
+        addMessage("system", `Memory imported: ${messages.length} messages, rules & profile restored. Bob continues from here.`, null, true);
         alert("Memory imported successfully.");
+        refreshDocList();
       } catch (err) {
         console.error(err);
         alert("Import failed: " + (err.message || err));
@@ -2438,6 +3012,98 @@ Source: CoinGecko`;
         e.target.value = ""; // allow re-import of same file
       }
     });
+
+    // ---------- Document upload + Profile UI ----------
+    async function refreshDocList() {
+      const el = document.getElementById("docList");
+      if (!el) return;
+      try {
+        const docs = await listDocuments();
+        if (!docs.length) {
+          el.innerHTML = "<em>No documents uploaded yet.</em>";
+          return;
+        }
+        el.innerHTML = docs.map(d => {
+          const kb = Math.round((d.charCount || 0) / 1024);
+          return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);">
+            <span>📄 ${escapeHtml(d.name)} <span style="opacity:.6">(${kb} KB)</span></span>
+            <button type="button" data-del-doc="${d.id}" style="background:none;border:none;color:var(--danger);font-size:12px;cursor:pointer;">Delete</button>
+          </div>`;
+        }).join("");
+        el.querySelectorAll("[data-del-doc]").forEach(btn => {
+          btn.addEventListener("click", async () => {
+            if (!confirm("Delete this document from Bob's memory?")) return;
+            await deleteDocument(Number(btn.dataset.delDoc));
+            refreshDocList();
+          });
+        });
+      } catch (_) {
+        el.innerHTML = "";
+      }
+    }
+
+    document.getElementById("viewProfileBtn")?.addEventListener("click", async () => {
+      const current = await getUserProfile();
+      const updated = prompt("Long-term User Profile (Bob uses this forever). Edit if you want:", current || "");
+      if (updated !== null) {
+        await setUserProfile(updated.trim());
+        alert(updated.trim() ? "Profile saved." : "Profile cleared.");
+      }
+    });
+
+    document.getElementById("uploadDocBtn")?.addEventListener("click", () => {
+      document.getElementById("docFileInput")?.click();
+    });
+
+    document.getElementById("docFileInput")?.addEventListener("change", async (e) => {
+      const files = Array.from(e.target.files || []);
+      if (!files.length) return;
+      for (const file of files) {
+        try {
+          let text = "";
+          const name = file.name;
+          if (file.type === "application/pdf" || name.toLowerCase().endsWith(".pdf")) {
+            text = await extractPdfText(file);
+          } else {
+            text = await file.text();
+          }
+          if (!text || text.trim().length < 20) {
+            alert(`Could not extract useful text from ${name}`);
+            continue;
+          }
+          // Cap very large files so we don't blow IndexedDB
+          if (text.length > 400000) text = text.slice(0, 400000);
+          await saveDocument({ name, type: file.type || "text", text, added: Date.now() });
+          addMessage("system", `Document "${name}" ingested (${Math.round(text.length/1024)} KB). Bob can now answer questions about it offline.`, null, true);
+        } catch (err) {
+          console.error(err);
+          alert(`Failed to process ${file.name}: ${err.message || err}`);
+        }
+      }
+      e.target.value = "";
+      refreshDocList();
+    });
+
+    // Client-side PDF text extraction using PDF.js
+    async function extractPdfText(file) {
+      // Dynamic import of PDF.js
+      const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs");
+      pdfjs.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjs.getDocument({ data: buf }).promise;
+      let full = "";
+      const maxPages = Math.min(pdf.numPages, 80); // safety limit
+      for (let i = 1; i <= maxPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        const pageText = content.items.map(it => it.str).join(" ");
+        full += pageText + "\n\n";
+      }
+      return full.trim();
+    }
+
+    // Refresh doc list when settings open
+    settingsBtn?.addEventListener("click", () => refreshDocList());
 
     serperKeyEl?.addEventListener("change", async () => {
       serperKey = (serperKeyEl.value || "").trim();
@@ -2462,9 +3128,11 @@ Source: CoinGecko`;
       populateVoices();
     }
 
-    setStatus("", "Model not loaded");
+    setStatus("", "Model not loaded — tap Load");
 
-    // Load saved voice preferences + auto-restore last model
+    // Load saved voice preferences. Do NOT auto-load the LLM on startup —
+    // auto-load was a common crash source on iPhone when the last model was large.
+    // User taps Load when ready (model is still cached after first download).
     (async () => {
       try {
         await loadVoiceSettings();
@@ -2476,11 +3144,15 @@ Source: CoinGecko`;
         if (last) {
           const opt = [...modelSelect.options].find(o => o.value === last);
           if (opt) modelSelect.value = last;
-          setTimeout(() => loadModel(true), 400);
+          // Prefer a safe model if last was a heavy 3B that may have crashed
+          if (/3B/i.test(last)) {
+            modelSelect.value = "SmolLM2-360M-Instruct-q4f16_1-MLC";
+          }
         }
       } catch (e) {
-        console.warn("Auto-load skipped", e);
+        console.warn("Model preselect skipped", e);
       }
+      setStatus("", "Tap Load to start (SmolLM2 recommended on iPhone)");
     })();
   </script>
 </body>
