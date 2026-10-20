@@ -3128,11 +3128,10 @@ Source: CoinGecko`;
       populateVoices();
     }
 
-    setStatus("", "Model not loaded — tap Load");
+    setStatus("", "Model not loaded");
 
-    // Load saved voice preferences. Do NOT auto-load the LLM on startup —
-    // auto-load was a common crash source on iPhone when the last model was large.
-    // User taps Load when ready (model is still cached after first download).
+    // Restore voice settings + auto-load last model from browser cache.
+    // Safe models auto-load; heavy 3B is downgraded to SmolLM2 to avoid crash loops.
     (async () => {
       try {
         await loadVoiceSettings();
@@ -3140,19 +3139,26 @@ Source: CoinGecko`;
         console.warn("Voice settings load failed", e);
       }
       try {
-        const last = await getLastModel();
+        let last = await getLastModel();
         if (last) {
-          const opt = [...modelSelect.options].find(o => o.value === last);
-          if (opt) modelSelect.value = last;
-          // Prefer a safe model if last was a heavy 3B that may have crashed
+          // Never auto-load a 3B model on mobile — it often kills Safari
           if (/3B/i.test(last)) {
-            modelSelect.value = "SmolLM2-360M-Instruct-q4f16_1-MLC";
+            last = "SmolLM2-360M-Instruct-q4f16_1-MLC";
+          }
+          const opt = [...modelSelect.options].find(o => o.value === last);
+          if (opt) {
+            modelSelect.value = last;
+            setStatus("loading", "Restoring model from cache…");
+            // Slight delay so the UI can paint first
+            setTimeout(() => loadModel(true), 500);
+            return;
           }
         }
+        setStatus("", "Tap Load to start (SmolLM2 recommended)");
       } catch (e) {
-        console.warn("Model preselect skipped", e);
+        console.warn("Auto-load skipped", e);
+        setStatus("", "Tap Load to start");
       }
-      setStatus("", "Tap Load to start (SmolLM2 recommended on iPhone)");
     })();
   </script>
 </body>
